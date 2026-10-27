@@ -92,6 +92,15 @@ Hooks run in order after the listener stops accepting new connections. Each rece
 - `HTTPServer()` exposes the underlying `*http.Server` for advanced tweaks (custom `ConnState`, HTTP/2 config).
 - `Shutdown(ctx)` performs a graceful shutdown outside of `Run` when you manage the listener yourself.
 
+## Running in Kubernetes
+
+Kubernetes sends SIGTERM before it kills the pod, and `graceful` already listens for it. Two settings have to agree, or the drain gets cut short:
+
+- `terminationGracePeriodSeconds` (default 30) is the total budget for the whole shutdown: hooks, connection draining, everything.
+- `ShutdownTimeout` (default 20s) must stay below it, with room to spare for the process to actually exit.
+
+If a shutdown ever ends with the pod SIGKILLed mid-drain, the grace period is too short for the timeout you configured. Raise the grace period first; shortening `ShutdownTimeout` also shortens the time in-flight requests get to finish.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
