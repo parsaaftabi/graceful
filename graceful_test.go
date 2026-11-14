@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,6 +51,7 @@ func waitUp(t *testing.T, addr string) {
 }
 
 func TestDefaults(t *testing.T) {
+	t.Parallel()
 	s := New(http.NotFoundHandler())
 	if s.srv.Addr != DefaultAddr {
 		t.Errorf("Addr = %q, want %q", s.srv.Addr, DefaultAddr)
@@ -72,6 +75,8 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
+	t.Parallel()
+	baseCtx := func(net.Listener) context.Context { return context.Background() }
 	s := New(http.NotFoundHandler(),
 		WithAddr("127.0.0.1:9999"),
 		WithReadHeaderTimeout(time.Second),
@@ -79,16 +84,41 @@ func TestOptions(t *testing.T) {
 		WithWriteTimeout(3*time.Second),
 		WithIdleTimeout(4*time.Second),
 		WithShutdownTimeout(5*time.Second),
+		WithMaxHeaderBytes(12345),
+		WithBaseContext(baseCtx),
 	)
-	if s.srv.Addr != "127.0.0.1:9999" {
-		t.Errorf("Addr = %q", s.srv.Addr)
+
+	tests := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{name: "addr", got: s.srv.Addr, want: "127.0.0.1:9999"},
+		{name: "read header timeout", got: s.srv.ReadHeaderTimeout, want: time.Second},
+		{name: "read timeout", got: s.srv.ReadTimeout, want: 2 * time.Second},
+		{name: "write timeout", got: s.srv.WriteTimeout, want: 3 * time.Second},
+		{name: "idle timeout", got: s.srv.IdleTimeout, want: 4 * time.Second},
+		{name: "shutdown timeout", got: s.shutdownTimeout, want: 5 * time.Second},
+		{name: "max header bytes", got: s.srv.MaxHeaderBytes, want: 12345},
 	}
-	if s.srv.ReadHeaderTimeout != time.Second ||
-		s.srv.ReadTimeout != 2*time.Second ||
-		s.srv.WriteTimeout != 3*time.Second ||
-		s.srv.IdleTimeout != 4*time.Second ||
-		s.shutdownTimeout != 5*time.Second {
-		t.Error("options were not applied")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.got != tt.want {
+				t.Errorf("got %v, want %v", tt.got, tt.want)
+			}
+		})
+	}
+	if s.srv.BaseContext == nil {
+		t.Error("BaseContext was not applied")
+	}
+}
+
+func TestWithBaseContext_NilKeepsDefault(t *testing.T) {
+	t.Parallel()
+	s := New(http.NotFoundHandler(), WithBaseContext(nil))
+	if s.srv.BaseContext != nil {
+		t.Error("nil BaseContext should keep the standard library default")
 	}
 }
 
@@ -209,11 +239,15 @@ func TestRun_HooksRunInOrder(t *testing.T) {
 	}
 }
 
-func TestRun_HookErrorDoesNotFailShutdown(t *testing.T) {
+// TestRun_HookErrorPropagates locks the v0.2.0 behavior change: hook errors
+// used to be logged and swallowed. Now every hook still runs, and Run
+// returns the hook error.
+func TestRun_HookErrorPropagates(t *testing.T) {
 	addr := freeAddr(t)
+	hookErr := errors.New("test hook error")
 	var secondRan atomic.Bool
 	s := New(http.NotFoundHandler(), WithAddr(addr), WithOnShutdown(
-		func(ctx context.Context) error { return errors.New("test hook error") },
+		func(ctx context.Context) error { return hookErr },
 		func(ctx context.Context) error { secondRan.Store(true); return nil },
 	))
 
@@ -224,8 +258,9 @@ func TestRun_HookErrorDoesNotFailShutdown(t *testing.T) {
 	waitUp(t, addr)
 	cancel()
 
-	if err := <-runErr; err != nil {
-		t.Errorf("Run returned %v, want nil despite hook error", err)
+	err := <-runErr
+	if !errors.Is(err, hookErr) {
+		t.Errorf("Run returned %v, want it to wrap the hook error", err)
 	}
 	if !secondRan.Load() {
 		t.Error("second hook did not run after first hook failed")
@@ -233,6 +268,7 @@ func TestRun_HookErrorDoesNotFailShutdown(t *testing.T) {
 }
 
 func TestRun_TLSConfigError(t *testing.T) {
+	t.Parallel()
 	s := New(http.NotFoundHandler(), WithTLS("cert.pem", ""))
 	if err := s.Run(context.Background()); err == nil {
 		t.Error("expected error for cert-without-key, got nil")
@@ -240,6 +276,7 @@ func TestRun_TLSConfigError(t *testing.T) {
 }
 
 func TestHTTPServerAccessor(t *testing.T) {
+	t.Parallel()
 	s := New(http.NotFoundHandler(), WithAddr("127.0.0.1:12345"))
 	if s.HTTPServer() != s.srv {
 		t.Error("HTTPServer() did not return the underlying server")
@@ -250,6 +287,7 @@ func TestHTTPServerAccessor(t *testing.T) {
 }
 
 func TestWithLogger(t *testing.T) {
+	t.Parallel()
 	def := New(http.NotFoundHandler(), WithLogger(nil))
 	if def.logger == nil {
 		t.Error("nil logger replaced the default")
@@ -292,6 +330,279 @@ func TestShutdown_Standalone(t *testing.T) {
 	}
 	if err := <-serveErr; err != nil {
 		t.Errorf("serve returned %v after Shutdown, want nil", err)
+	}
+}
+
+// TestRun_ShutdownTimeoutForceClose is the regression test for the old Run
+// shutdown path. A handler that outlives ShutdownTimeout must not keep Run
+// waiting. Run has to close the server by force and return the shutdown
+// error within a bounded time.
+func TestRun_ShutdownTimeoutForceClose(t *testing.T) {
+	addr := freeAddr(t)
+	handlerStarted := make(chan struct{})
+	var startedOnce sync.Once
+	var hookRan atomic.Bool
+	s := New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedOnce.Do(func() { close(handlerStarted) })
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	}), WithAddr(addr),
+		WithShutdownTimeout(300*time.Millisecond),
+		WithOnShutdown(func(ctx context.Context) error {
+			hookRan.Store(true)
+			return nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(ctx) }()
+	waitUp(t, addr)
+
+	go func() {
+		resp, err := http.Get("http://" + addr)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Error("Run returned nil, want the shutdown timeout error")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Run error = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("Run took %v after cancel, want under 3s", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return within 3s of cancel; shutdown timeout did not force close")
+	}
+	if !hookRan.Load() {
+		t.Error("shutdown hook did not run on the timeout path")
+	}
+}
+
+func TestServe_OnListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	s := New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("via listener"))
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Serve(ctx, ln) }()
+	waitUp(t, addr)
+
+	resp, err := http.Get("http://" + addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "via listener" {
+		t.Errorf("body = %q, want %q", body, "via listener")
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after cancel")
+	}
+}
+
+func TestServe_NilListener(t *testing.T) {
+	t.Parallel()
+	s := New(http.NotFoundHandler())
+	if err := s.Serve(context.Background(), nil); err == nil {
+		t.Error("expected error for nil listener, got nil")
+	}
+}
+
+func TestServe_BaseContextValueReachesHandler(t *testing.T) {
+	type ctxKey struct{}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	s := New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, _ := r.Context().Value(ctxKey{}).(string)
+		w.Write([]byte(v))
+	}), WithBaseContext(func(net.Listener) context.Context {
+		return context.WithValue(context.Background(), ctxKey{}, "from base")
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Serve(ctx, ln) }()
+	waitUp(t, addr)
+
+	resp, err := http.Get("http://" + addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "from base" {
+		t.Errorf("body = %q, want %q", body, "from base")
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Errorf("Serve returned %v, want nil", err)
+	}
+}
+
+func TestServe_MaxHeaderBytesRejectsOversizedHeader(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	s := New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}), WithMaxHeaderBytes(2048))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Serve(ctx, ln) }()
+	waitUp(t, addr)
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Big", strings.Repeat("a", 8192))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusRequestHeaderFieldsTooLarge)
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Errorf("Serve returned %v, want nil", err)
+	}
+}
+
+func TestShutdown_CalledTwiceRunsHooksOnce(t *testing.T) {
+	addr := freeAddr(t)
+	var hookCalls atomic.Int32
+	s := New(http.NotFoundHandler(), WithAddr(addr), WithOnShutdown(
+		func(ctx context.Context) error {
+			hookCalls.Add(1)
+			return nil
+		},
+	))
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.serve() }()
+	waitUp(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("first Shutdown returned %v", err)
+	}
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("second Shutdown returned %v, want the first result (nil)", err)
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Errorf("hook ran %d times, want 1", got)
+	}
+	if err := <-serveErr; err != nil {
+		t.Errorf("serve returned %v after Shutdown, want nil", err)
+	}
+}
+
+func TestShutdown_ConcurrentCallsShareResult(t *testing.T) {
+	addr := freeAddr(t)
+	hookErr := errors.New("pool close failed")
+	var hookCalls atomic.Int32
+	s := New(http.NotFoundHandler(), WithAddr(addr), WithOnShutdown(
+		func(ctx context.Context) error {
+			hookCalls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			return hookErr
+		},
+	))
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.serve() }()
+	waitUp(t, addr)
+
+	const callers = 5
+	results := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results[i] = s.Shutdown(ctx)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range results {
+		if !errors.Is(err, hookErr) {
+			t.Errorf("caller %d got %v, want the shared hook error", i, err)
+		}
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Errorf("hook ran %d times, want 1", got)
+	}
+	if err := <-serveErr; err != nil {
+		t.Errorf("serve returned %v after Shutdown, want nil", err)
+	}
+}
+
+func TestShutdown_HookErrorsJoined(t *testing.T) {
+	errA := errors.New("flush failed")
+	errB := errors.New("pool close failed")
+	s := New(http.NotFoundHandler(), WithOnShutdown(
+		func(ctx context.Context) error { return errA },
+		func(ctx context.Context) error { return errB },
+	))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := s.Shutdown(ctx)
+	if !errors.Is(err, errA) {
+		t.Errorf("Shutdown error %v does not wrap first hook error", err)
+	}
+	if !errors.Is(err, errB) {
+		t.Errorf("Shutdown error %v does not wrap second hook error", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -45,6 +46,26 @@ func ExampleServer_customTimeouts() {
 	)
 
 	if err := srv.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ExampleServer_Serve shows binding the listener yourself. Port 0 in a
+// test, a unix socket, or a socket handed over by the service manager all
+// work the same way. Run and Serve differ only in who creates the listener.
+func ExampleServer_Serve() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := graceful.New(mux)
+	if err := srv.Serve(context.Background(), ln); err != nil {
 		log.Fatal(err)
 	}
 }

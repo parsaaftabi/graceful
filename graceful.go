@@ -29,9 +29,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -58,8 +60,12 @@ const (
 
 // Hook runs during graceful shutdown with the shutdown context, which is
 // cancelled when ShutdownTimeout elapses. Use hooks to close database pools,
-// flush telemetry, or release any other resource. A hook that returns an
-// error is logged; it never aborts the shutdown of the remaining hooks.
+// flush telemetry, or release any other resource.
+//
+// Hooks run in order and all of them run, even when one fails. A hook error
+// is logged and collected. Shutdown and Run return the collected errors
+// joined with [errors.Join]. Before v0.2.0 hook errors were only logged and
+// shutdown always reported success. That hid cleanup failures, so it changed.
 type Hook func(ctx context.Context) error
 
 // Server is an http.Server with production timeouts, signal handling, and
@@ -71,12 +77,16 @@ type Server struct {
 	hooks           []Hook
 	certFile        string
 	keyFile         string
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // Option configures a Server.
 type Option func(*Server)
 
-// WithAddr sets the listen address. Default DefaultAddr (":8080").
+// WithAddr sets the listen address used by Run. Default DefaultAddr
+// (":8080"). Serve ignores it and uses the listener it is given.
 func WithAddr(addr string) Option {
 	return func(s *Server) { s.srv.Addr = addr }
 }
@@ -109,9 +119,32 @@ func WithIdleTimeout(d time.Duration) Option {
 
 // WithShutdownTimeout sets how long graceful shutdown may take before the
 // shutdown context is cancelled. Default DefaultShutdownTimeout. It must
-// cover your slowest in-flight request plus every shutdown hook.
+// cover your slowest in-flight request plus every shutdown hook. If it
+// expires first, Run and Serve close the server by force and return the
+// shutdown error instead of waiting for blocked handlers.
 func WithShutdownTimeout(d time.Duration) Option {
 	return func(s *Server) { s.shutdownTimeout = d }
+}
+
+// WithMaxHeaderBytes sets the maximum size of request headers in bytes.
+// It wraps [http.Server.MaxHeaderBytes]. The default is 0, which means the
+// standard library limit of 1 MB. Requests with larger headers get a 431
+// response and the connection is closed.
+func WithMaxHeaderBytes(n int) Option {
+	return func(s *Server) { s.srv.MaxHeaderBytes = n }
+}
+
+// WithBaseContext sets the function that builds the base context for each
+// request. It wraps [http.Server.BaseContext]. Use it to put values every
+// handler needs, such as a request-scoped logger parent or a tenant ID,
+// into the request context. A nil function keeps the standard library
+// default, [context.Background].
+func WithBaseContext(fn func(net.Listener) context.Context) Option {
+	return func(s *Server) {
+		if fn != nil {
+			s.srv.BaseContext = fn
+		}
+	}
 }
 
 // WithLogger sets the logger used for lifecycle events. Default is a text
@@ -126,13 +159,14 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithOnShutdown appends hooks run, in order, during graceful shutdown after
 // the HTTP listener has stopped accepting new connections. Each hook gets
-// the shutdown context; hook errors are logged and never abort shutdown.
+// the shutdown context. All hooks run even when one fails. Hook errors are
+// logged, collected, and returned by Shutdown and Run.
 func WithOnShutdown(hooks ...Hook) Option {
 	return func(s *Server) { s.hooks = append(s.hooks, hooks...) }
 }
 
 // WithTLS enables HTTPS. Both files must be set or neither; passing only
-// one is a configuration error reported by Run.
+// one is a configuration error reported by Run and Serve.
 func WithTLS(certFile, keyFile string) Option {
 	return func(s *Server) {
 		s.certFile = certFile
@@ -170,9 +204,35 @@ func (s *Server) HTTPServer() *http.Server { return s.srv }
 // accepting new connections, in-flight requests are drained, and shutdown
 // hooks run. It returns nil on clean shutdown.
 //
+// If shutdown does not finish within ShutdownTimeout, Run closes the server
+// by force and returns the shutdown error. It does not wait for a blocked
+// handler to finish.
+//
 // If the server fails to start (bad address, TLS misconfiguration), Run
 // returns that error instead of blocking.
 func (s *Server) Run(ctx context.Context) error {
+	return s.run(ctx, s.serve)
+}
+
+// Serve is Run for a listener you created yourself. Bind the listener in
+// your own code when you need port 0 in tests, a unix socket, or a socket
+// passed in by the service manager (systemd socket activation, for
+// example). WithAddr does not apply here.
+//
+// Serve blocks until ctx is cancelled or the process receives
+// SIGINT/SIGTERM, then shuts down the same way Run does, force close on
+// timeout included. Shutdown closes the listener, so do not reuse it after
+// Serve returns. WithTLS applies the same way as in Run.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if ln == nil {
+		return errors.New("graceful: Serve requires a non-nil listener")
+	}
+	return s.run(ctx, func() error { return s.serveListener(ln) })
+}
+
+// run is the shared body of Run and Serve. serveFn starts the listener and
+// blocks; run owns signals and shutdown.
+func (s *Server) run(ctx context.Context, serveFn func() error) error {
 	if (s.certFile == "") != (s.keyFile == "") {
 		return errors.New("graceful: WithTLS requires both cert and key files")
 	}
@@ -181,14 +241,23 @@ func (s *Server) Run(ctx context.Context) error {
 	defer stop()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- s.serve() }()
+	go func() { errCh <- serveFn() }()
 
 	select {
 	case <-ctx.Done():
 		s.logger.Info("shutdown initiated", "reason", ctx.Err())
 		shutCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 		defer cancel()
-		return errors.Join(s.graceful(shutCtx), <-errCh)
+		shutErr := s.graceful(shutCtx)
+		if shutErr != nil {
+			// Shutdown gave up, usually because a handler outlived
+			// ShutdownTimeout. Close the server by force so the serve
+			// goroutine exits, then drain errCh. Without the Close,
+			// this receive can wait on a server that is still holding
+			// connections open.
+			_ = s.srv.Close()
+		}
+		return errors.Join(shutErr, <-errCh)
 	case err := <-errCh:
 		return err
 	}
@@ -197,11 +266,16 @@ func (s *Server) Run(ctx context.Context) error {
 // Shutdown performs a graceful shutdown outside of Run: it stops accepting
 // new connections, drains in-flight requests, and runs shutdown hooks. The
 // context bounds the whole operation.
+//
+// Shutdown is safe to call more than once, including from several
+// goroutines at the same time. The first call does the work. Later calls
+// wait for the first one and return its result. Hooks run once.
 func (s *Server) Shutdown(ctx context.Context) error {
 	return s.graceful(ctx)
 }
 
-// serve runs the listener; http.ErrServerClosed is a clean exit.
+// serve runs the listener on the configured address; http.ErrServerClosed
+// is a clean exit.
 func (s *Server) serve() error {
 	s.logger.Info("listening", "addr", s.srv.Addr, "tls", s.certFile != "")
 	var err error
@@ -210,27 +284,61 @@ func (s *Server) serve() error {
 	} else {
 		err = s.srv.ListenAndServe()
 	}
+	return wrapServeErr(err)
+}
+
+// serveListener runs the server on a caller-supplied listener.
+func (s *Server) serveListener(ln net.Listener) error {
+	s.logger.Info("listening", "addr", ln.Addr().String(), "tls", s.certFile != "")
+	var err error
+	if s.certFile != "" {
+		err = s.srv.ServeTLS(ln, s.certFile, s.keyFile)
+	} else {
+		err = s.srv.Serve(ln)
+	}
+	return wrapServeErr(err)
+}
+
+func wrapServeErr(err error) error {
 	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	if err == nil {
 		return nil
 	}
 	return fmt.Errorf("graceful: serve: %w", err)
 }
 
-// graceful stops the listener, drains requests, and runs hooks in order.
+// graceful runs the shutdown once and returns the stored result to every
+// later caller.
 func (s *Server) graceful(ctx context.Context) error {
+	s.shutdownOnce.Do(func() {
+		s.shutdownErr = s.doGraceful(ctx)
+	})
+	return s.shutdownErr
+}
+
+// doGraceful stops the listener, drains requests, and runs hooks in order.
+// A failed drain does not skip the hooks. Every error is logged and the
+// errors are returned joined.
+func (s *Server) doGraceful(ctx context.Context) error {
 	start := time.Now()
 
+	var errs []error
 	if err := s.srv.Shutdown(ctx); err != nil {
 		s.logger.Error("http shutdown failed", "error", err)
-		return fmt.Errorf("graceful: http shutdown: %w", err)
+		errs = append(errs, fmt.Errorf("graceful: http shutdown: %w", err))
 	}
 
 	for i, hook := range s.hooks {
 		if err := hook(ctx); err != nil {
-			// Logged, never fatal: one misbehaving hook must not
-			// prevent the rest of the cleanup from running.
 			s.logger.Error("shutdown hook failed", "hook", i, "error", err)
+			errs = append(errs, fmt.Errorf("graceful: shutdown hook %d: %w", i, err))
 		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	s.logger.Info("shutdown complete", "duration", time.Since(start).Round(time.Millisecond))
